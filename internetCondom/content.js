@@ -85,10 +85,58 @@ loadModels().then(() => {
   });
 });
 
-// Handle messages from background
+// Handle messages from background and popup
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === "BLOCK_FACE" && msg.src) {
     handleBlockFace(msg.src, msg.originalSrc);
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === "REFRESH_SETTINGS") {
+    // Reload settings from storage
+    chrome.storage.local.get(["savedFaces", "blockWomen"], (result) => {
+      // Update blockWomen setting
+      if (result.blockWomen !== undefined) {
+        blockWomen = result.blockWomen;
+      }
+      console.log(`🔄 Settings refreshed: blockWomen=${blockWomen}`);
+
+      // Rebuild face matcher
+      if (result.savedFaces?.length > 0) {
+        faceMatcher = new faceapi.FaceMatcher(
+          result.savedFaces.map(
+            (f) =>
+              new faceapi.LabeledFaceDescriptors(
+                f.label,
+                f.descriptors.map((d) => new Float32Array(d))
+              )
+          ),
+          0.6
+        );
+        console.log(`✅ Loaded ${result.savedFaces.length} blocked face(s)`);
+      } else {
+        faceMatcher = null;
+        console.log(`ℹ️ No blocked faces`);
+      }
+
+      // Clear blocked state and rescan
+      scannedImages = new Set();
+      blockedImageUrls = new Map();
+
+      // Remove existing overlays
+      document.querySelectorAll(".blocked-image-wrapper").forEach((wrapper) => {
+        const img = wrapper.querySelector("img");
+        if (img) {
+          img.style.filter = "";
+          img.dataset.hasOverlay = "";
+          wrapper.parentNode.insertBefore(img, wrapper);
+          wrapper.remove();
+        }
+      });
+
+      queueVisibleImages();
+    });
     reply({ ok: true });
     return true;
   }
@@ -107,11 +155,30 @@ async function handleBlockFace(src, originalSrc) {
 
     if (detection) {
       console.log("✅ Face detected! Saving...");
+
+      // Extract face thumbnail
+      const box = detection.detection.box;
+      const padding = 40; // Add padding around face
+      const x = Math.max(0, box.x - padding);
+      const y = Math.max(0, box.y - padding);
+      const width = Math.min(img.width - x, box.width + padding * 2);
+      const height = Math.min(img.height - y, box.height + padding * 2);
+
+      // Create thumbnail canvas
+      const canvas = document.createElement("canvas");
+      const thumbSize = 80;
+      canvas.width = thumbSize;
+      canvas.height = thumbSize;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, x, y, width, height, 0, 0, thumbSize, thumbSize);
+      const thumbnail = canvas.toDataURL("image/jpeg", 0.7);
+
       const data = await chrome.storage.local.get(["savedFaces"]);
       const savedFaces = data.savedFaces || [];
       savedFaces.push({
         label: `blocked_${Date.now()}`,
         descriptors: [Array.from(detection.descriptor)],
+        thumbnail: thumbnail, // Save the face thumbnail
       });
       await chrome.storage.local.set({ savedFaces });
 
@@ -125,7 +192,7 @@ async function handleBlockFace(src, originalSrc) {
         ),
         0.6
       );
-      console.log("✅ Face blocked! Rescanning...");
+      console.log("✅ Face blocked with thumbnail! Rescanning...");
       scannedImages = new Set();
       blockedImageUrls = new Map();
       queueVisibleImages();
@@ -217,10 +284,14 @@ function addOverlay(imgElement, reason, emoji = "🚫") {
 
 // Queue images for scanning
 function queueVisibleImages() {
-  const images = document.querySelectorAll('img[src*="twimg.com"]');
+  // Get all Twitter images including media, profile pics, and quote tweets
+  const images = document.querySelectorAll(
+    'img[src*="twimg.com"], img[src*="pbs.twimg"]'
+  );
 
   for (const img of images) {
-    if (img.width < 80 || img.height < 80) continue;
+    // Lower threshold to catch smaller images in quote tweets
+    if (img.width < 50 || img.height < 50) continue;
     if (img.dataset.hasOverlay) continue;
 
     const imgUrl = img.src.split("?")[0];
@@ -255,50 +326,72 @@ async function processQueue() {
       if (dataUrl) {
         const loadedImg = await loadImage(dataUrl);
 
-        const detection = await faceapi
-          .detectSingleFace(loadedImg)
+        // Detect ALL faces in the image
+        const detections = await faceapi
+          .detectAllFaces(loadedImg)
           .withFaceLandmarks()
-          .withFaceDescriptor()
           .withAgeAndGender();
 
-        if (detection) {
+        console.log(`🔍 Found ${detections.length} face(s) in image`);
+
+        let shouldBlock = false;
+        let blockReason = "";
+        let blockEmoji = "🚫";
+
+        for (const detection of detections) {
           const { gender, genderProbability } = detection;
           console.log(
-            `🔍 Face detected: ${gender} (${(genderProbability * 100).toFixed(
-              0
-            )}% confident)`
+            `   → ${gender} (${(genderProbability * 100).toFixed(0)}%)`
           );
-
-          // Check for blocked face match
-          if (faceMatcher) {
-            const match = faceMatcher.findBestMatch(detection.descriptor);
-            if (match.label !== "unknown" && match.distance < 0.6) {
-              console.log(`🚨 BLOCKED FACE MATCH!`);
-              addOverlay(img, "Blocked Face Detected", "🚫");
-              isScanning = false;
-              if (scanQueue.length > 0) setTimeout(processQueue, 100);
-              return;
-            }
-          }
 
           // Check for female
           if (blockWomen && gender === "female" && genderProbability > 0.7) {
-            console.log(
-              `👩 Foid detected (${(genderProbability * 100).toFixed(0)}%)`
-            );
-            addOverlay(img, "Foid Detected", "👩");
+            console.log(`   👩 Foid detected!`);
+            shouldBlock = true;
+            blockReason = "Foid Detected";
+            blockEmoji = "👩";
+            break;
           }
+        }
+
+        // Also check for blocked face match (need descriptors for this)
+        if (!shouldBlock && faceMatcher) {
+          try {
+            const detectionsWithDesc = await faceapi
+              .detectAllFaces(loadedImg)
+              .withFaceLandmarks()
+              .withFaceDescriptors();
+
+            for (const det of detectionsWithDesc) {
+              const match = faceMatcher.findBestMatch(det.descriptor);
+              if (match.label !== "unknown" && match.distance < 0.6) {
+                console.log(
+                  `   🚨 BLOCKED FACE MATCH! (${match.distance.toFixed(2)})`
+                );
+                shouldBlock = true;
+                blockReason = "Blocked Face Detected";
+                blockEmoji = "🚫";
+                break;
+              }
+            }
+          } catch (e) {
+            // Descriptor detection failed, continue
+          }
+        }
+
+        if (shouldBlock) {
+          addOverlay(img, blockReason, blockEmoji);
         }
       }
     } catch (e) {
-      // Silent fail
+      console.log(`   ⚠️ Scan error: ${e.message}`);
     }
   }
 
   isScanning = false;
 
   if (scanQueue.length > 0) {
-    setTimeout(processQueue, 100);
+    setTimeout(processQueue, 50); // Faster processing
   }
 }
 

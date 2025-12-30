@@ -1,10 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Internet Condom X — Taint-Free Face Blocker",
+  "name": "Internet Condom X — Face Blocker",
   "version": "1.0",
   "permissions": ["storage", "contextMenus", "activeTab"],
   "host_permissions": ["https://x.com/*", "https://pbs.twimg.com/*"],
   "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Internet Condom"
+  },
   "content_scripts": [
     {
       "matches": ["https://x.com/*"],
