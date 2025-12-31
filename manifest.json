@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Internet Condom X — Face Blocker",
+  "name": "Internet Condom",
   "version": "1.0",
   "permissions": ["storage", "contextMenus", "activeTab"],
   "host_permissions": ["https://x.com/*", "https://pbs.twimg.com/*"],
