@@ -1,16 +1,17 @@
-console.log("Internet Condom X: Face Blocker Active");
+console.log("Internet Condom");
 
 let faceMatcher = null;
 let modelsLoaded = false;
-let scannedImages = new Set(); // URLs we've analyzed
-let blockedImageUrls = new Map(); // URL -> {reason, emoji} for re-applying on scroll
-let scanQueue = [];
-let isScanning = false;
-
-// Settings
+let scannedImages = new Set();
+let blockedImageUrls = new Map();
+let pendingScans = new Map(); // Track in-progress scans
 let blockWomen = true;
 
-// Detect what page we're on
+// Parallel processing config
+const MAX_CONCURRENT_SCANS = 4;
+let activeScans = 0;
+
+// Detect page type
 function getPageType() {
   const path = window.location.pathname;
   if (path === "/home" || path === "/") return "timeline";
@@ -32,7 +33,7 @@ async function loadModels() {
       faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL),
     ]);
     modelsLoaded = true;
-    console.log("✅ Models loaded (including gender detection)!");
+    console.log("✅ Models loaded!");
     return true;
   } catch (e) {
     console.error("❌ Failed to load models:", e);
@@ -40,11 +41,16 @@ async function loadModels() {
   }
 }
 
-// Request image from background script
-function fetchImageAsDataUrl(url) {
+// Fetch image via background script (cached)
+const imageCache = new Map();
+async function fetchImageAsDataUrl(url) {
+  if (imageCache.has(url)) return imageCache.get(url);
+
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: "FETCH_IMAGE", url }, (response) => {
-      resolve(response?.dataUrl || null);
+      const dataUrl = response?.dataUrl || null;
+      if (dataUrl) imageCache.set(url, dataUrl);
+      resolve(dataUrl);
     });
   });
 }
@@ -62,9 +68,7 @@ function loadImage(src) {
 // Initialize
 loadModels().then(() => {
   chrome.storage.local.get(["savedFaces", "blockWomen"], (result) => {
-    if (result.blockWomen !== undefined) {
-      blockWomen = result.blockWomen;
-    }
+    if (result.blockWomen !== undefined) blockWomen = result.blockWomen;
     console.log(`👩 Block women: ${blockWomen ? "ON" : "OFF"}`);
 
     if (result.savedFaces?.length > 0) {
@@ -81,11 +85,11 @@ loadModels().then(() => {
       console.log(`✅ Loaded ${result.savedFaces.length} blocked face(s)`);
     }
     console.log(`📍 Page: ${getPageType()}`);
-    queueVisibleImages();
+    startObserving();
   });
 });
 
-// Handle messages from background and popup
+// Message handler
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === "BLOCK_FACE" && msg.src) {
     handleBlockFace(msg.src, msg.originalSrc);
@@ -94,15 +98,10 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === "REFRESH_SETTINGS") {
-    // Reload settings from storage
     chrome.storage.local.get(["savedFaces", "blockWomen"], (result) => {
-      // Update blockWomen setting
-      if (result.blockWomen !== undefined) {
-        blockWomen = result.blockWomen;
-      }
+      if (result.blockWomen !== undefined) blockWomen = result.blockWomen;
       console.log(`🔄 Settings refreshed: blockWomen=${blockWomen}`);
 
-      // Rebuild face matcher
       if (result.savedFaces?.length > 0) {
         faceMatcher = new faceapi.FaceMatcher(
           result.savedFaces.map(
@@ -114,17 +113,15 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
           ),
           0.6
         );
-        console.log(`✅ Loaded ${result.savedFaces.length} blocked face(s)`);
       } else {
         faceMatcher = null;
-        console.log(`ℹ️ No blocked faces`);
       }
 
-      // Clear blocked state and rescan
+      // Clear and rescan
       scannedImages = new Set();
       blockedImageUrls = new Map();
+      imageCache.clear();
 
-      // Remove existing overlays
       document.querySelectorAll(".blocked-image-wrapper").forEach((wrapper) => {
         const img = wrapper.querySelector("img");
         if (img) {
@@ -135,7 +132,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
         }
       });
 
-      queueVisibleImages();
+      scanAllVisible();
     });
     reply({ ok: true });
     return true;
@@ -156,21 +153,18 @@ async function handleBlockFace(src, originalSrc) {
     if (detection) {
       console.log("✅ Face detected! Saving...");
 
-      // Extract face thumbnail
       const box = detection.detection.box;
-      const padding = 40; // Add padding around face
+      const padding = 40;
       const x = Math.max(0, box.x - padding);
       const y = Math.max(0, box.y - padding);
       const width = Math.min(img.width - x, box.width + padding * 2);
       const height = Math.min(img.height - y, box.height + padding * 2);
 
-      // Create thumbnail canvas
       const canvas = document.createElement("canvas");
-      const thumbSize = 80;
-      canvas.width = thumbSize;
-      canvas.height = thumbSize;
+      canvas.width = 80;
+      canvas.height = 80;
       const ctx = canvas.getContext("2d");
-      ctx.drawImage(img, x, y, width, height, 0, 0, thumbSize, thumbSize);
+      ctx.drawImage(img, x, y, width, height, 0, 0, 80, 80);
       const thumbnail = canvas.toDataURL("image/jpeg", 0.7);
 
       const data = await chrome.storage.local.get(["savedFaces"]);
@@ -178,7 +172,7 @@ async function handleBlockFace(src, originalSrc) {
       savedFaces.push({
         label: `blocked_${Date.now()}`,
         descriptors: [Array.from(detection.descriptor)],
-        thumbnail: thumbnail, // Save the face thumbnail
+        thumbnail,
       });
       await chrome.storage.local.set({ savedFaces });
 
@@ -192,10 +186,12 @@ async function handleBlockFace(src, originalSrc) {
         ),
         0.6
       );
-      console.log("✅ Face blocked with thumbnail! Rescanning...");
+
+      console.log("✅ Face blocked! Rescanning...");
       scannedImages = new Set();
       blockedImageUrls = new Map();
-      queueVisibleImages();
+      imageCache.clear();
+      scanAllVisible();
     } else {
       console.log("❌ No face detected");
     }
@@ -204,21 +200,18 @@ async function handleBlockFace(src, originalSrc) {
   }
 }
 
-// Add overlay on the image with toggle support
+// Add overlay
 function addOverlay(imgElement, reason, emoji = "🚫") {
   if (imgElement.dataset.hasOverlay) return;
   imgElement.dataset.hasOverlay = "true";
 
-  // Store for re-applying on scroll
   const imgUrl = imgElement.src.split("?")[0];
   blockedImageUrls.set(imgUrl, { reason, emoji });
 
   console.log(`${emoji} ${reason}`);
 
-  // Blur the image
   imgElement.style.filter = "blur(25px)";
 
-  // Create wrapper
   const wrapper = document.createElement("div");
   wrapper.className = "blocked-image-wrapper";
   wrapper.style.cssText = `
@@ -231,16 +224,12 @@ function addOverlay(imgElement, reason, emoji = "🚫") {
   imgElement.parentNode.insertBefore(wrapper, imgElement);
   wrapper.appendChild(imgElement);
 
-  // Full overlay covering the image
   const overlay = document.createElement("div");
   overlay.className = "blocked-overlay";
   overlay.dataset.revealed = "false";
   overlay.style.cssText = `
     position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
+    top: 0; left: 0; width: 100%; height: 100%;
     background: rgba(0, 0, 0, 0.95);
     display: flex;
     flex-direction: column;
@@ -252,27 +241,22 @@ function addOverlay(imgElement, reason, emoji = "🚫") {
   `;
 
   overlay.innerHTML = `
-    <div class="overlay-content">
+    <div style="text-align: center;">
       <div style="font-size: 48px; margin-bottom: 10px;">${emoji}</div>
       <div style="color: white; font-size: 16px; font-weight: bold;">${reason}</div>
       <div style="color: #888; font-size: 12px; margin-top: 5px;">Click to reveal/hide</div>
     </div>
   `;
 
-  // Toggle on click
   overlay.onclick = (e) => {
     e.stopPropagation();
     e.preventDefault();
-
     const isRevealed = overlay.dataset.revealed === "true";
-
     if (isRevealed) {
-      // Hide again (re-blur)
       imgElement.style.filter = "blur(25px)";
       overlay.style.opacity = "1";
       overlay.dataset.revealed = "false";
     } else {
-      // Reveal
       imgElement.style.filter = "none";
       overlay.style.opacity = "0";
       overlay.dataset.revealed = "true";
@@ -282,137 +266,169 @@ function addOverlay(imgElement, reason, emoji = "🚫") {
   wrapper.appendChild(overlay);
 }
 
-// Queue images for scanning
-function queueVisibleImages() {
-  // Get all Twitter images including media, profile pics, and quote tweets
-  const images = document.querySelectorAll(
-    'img[src*="twimg.com"], img[src*="pbs.twimg"]'
-  );
+// Scan a single image (runs in parallel)
+async function scanImage(img) {
+  const imgUrl = img.src.split("?")[0];
 
-  for (const img of images) {
-    // Lower threshold to catch smaller images in quote tweets
-    if (img.width < 50 || img.height < 50) continue;
-    if (img.dataset.hasOverlay) continue;
-
-    const imgUrl = img.src.split("?")[0];
-
-    // Re-apply overlay if this URL was previously blocked (handles scroll back up)
-    if (blockedImageUrls.has(imgUrl)) {
-      const { reason, emoji } = blockedImageUrls.get(imgUrl);
-      addOverlay(img, reason, emoji);
-      continue;
-    }
-
-    // Skip if already scanned
-    if (scannedImages.has(imgUrl)) continue;
-
-    scannedImages.add(imgUrl);
-    scanQueue.push(img);
+  if (
+    img.dataset.hasOverlay ||
+    scannedImages.has(imgUrl) ||
+    pendingScans.has(imgUrl)
+  ) {
+    return;
   }
 
-  processQueue();
-}
+  // Check if already blocked
+  if (blockedImageUrls.has(imgUrl)) {
+    const { reason, emoji } = blockedImageUrls.get(imgUrl);
+    addOverlay(img, reason, emoji);
+    return;
+  }
 
-// Process scan queue one at a time
-async function processQueue() {
-  if (isScanning || scanQueue.length === 0) return;
-  isScanning = true;
+  scannedImages.add(imgUrl);
+  pendingScans.set(imgUrl, true);
+  activeScans++;
 
-  const img = scanQueue.shift();
+  try {
+    const dataUrl = await fetchImageAsDataUrl(img.src);
+    if (!dataUrl || img.dataset.hasOverlay) {
+      return;
+    }
 
-  if (img && img.src && !img.dataset.hasOverlay) {
-    try {
-      const dataUrl = await fetchImageAsDataUrl(img.src);
-      if (dataUrl) {
-        const loadedImg = await loadImage(dataUrl);
+    const loadedImg = await loadImage(dataUrl);
 
-        // Detect ALL faces in the image
-        const detections = await faceapi
-          .detectAllFaces(loadedImg)
-          .withFaceLandmarks()
-          .withAgeAndGender();
+    // Single detection call for both gender and descriptors
+    const detections = await faceapi
+      .detectAllFaces(loadedImg)
+      .withFaceLandmarks()
+      .withFaceDescriptors()
+      .withAgeAndGender();
 
-        console.log(`🔍 Found ${detections.length} face(s) in image`);
+    if (detections.length === 0) return;
 
-        let shouldBlock = false;
-        let blockReason = "";
-        let blockEmoji = "🚫";
+    let shouldBlock = false;
+    let blockReason = "";
+    let blockEmoji = "🚫";
 
-        for (const detection of detections) {
-          const { gender, genderProbability } = detection;
-          console.log(
-            `   → ${gender} (${(genderProbability * 100).toFixed(0)}%)`
-          );
+    for (const detection of detections) {
+      // Check gender (0.5 threshold = aggressive, catches edge cases)
+      if (
+        blockWomen &&
+        detection.gender === "female" &&
+        detection.genderProbability > 0.5
+      ) {
+        shouldBlock = true;
+        blockReason = "Foid Detected";
+        blockEmoji = "👩";
+        break;
+      }
 
-          // Check for female
-          if (blockWomen && gender === "female" && genderProbability > 0.7) {
-            console.log(`   👩 Foid detected!`);
-            shouldBlock = true;
-            blockReason = "Foid Detected";
-            blockEmoji = "👩";
-            break;
-          }
-        }
-
-        // Also check for blocked face match (need descriptors for this)
-        if (!shouldBlock && faceMatcher) {
-          try {
-            const detectionsWithDesc = await faceapi
-              .detectAllFaces(loadedImg)
-              .withFaceLandmarks()
-              .withFaceDescriptors();
-
-            for (const det of detectionsWithDesc) {
-              const match = faceMatcher.findBestMatch(det.descriptor);
-              if (match.label !== "unknown" && match.distance < 0.6) {
-                console.log(
-                  `   🚨 BLOCKED FACE MATCH! (${match.distance.toFixed(2)})`
-                );
-                shouldBlock = true;
-                blockReason = "Blocked Face Detected";
-                blockEmoji = "🚫";
-                break;
-              }
-            }
-          } catch (e) {
-            // Descriptor detection failed, continue
-          }
-        }
-
-        if (shouldBlock) {
-          addOverlay(img, blockReason, blockEmoji);
+      // Check blocked faces
+      if (faceMatcher && detection.descriptor) {
+        const match = faceMatcher.findBestMatch(detection.descriptor);
+        if (match.label !== "unknown" && match.distance < 0.6) {
+          shouldBlock = true;
+          blockReason = "Blocked Face Detected";
+          blockEmoji = "🚫";
+          break;
         }
       }
-    } catch (e) {
-      console.log(`   ⚠️ Scan error: ${e.message}`);
     }
-  }
 
-  isScanning = false;
-
-  if (scanQueue.length > 0) {
-    setTimeout(processQueue, 50); // Faster processing
+    if (shouldBlock && !img.dataset.hasOverlay) {
+      addOverlay(img, blockReason, blockEmoji);
+    }
+  } catch (e) {
+    // Silent fail
+  } finally {
+    pendingScans.delete(imgUrl);
+    activeScans--;
+    processNextBatch();
   }
 }
 
-// Watch for new content and scroll (debounced)
-let debounceTimer;
-const observer = new MutationObserver(() => {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(queueVisibleImages, 300);
-});
-observer.observe(document.body, { childList: true, subtree: true });
+// Process images in batches
+let imageQueue = [];
 
-// Also check on scroll for images that reappear
-let scrollTimer;
-window.addEventListener(
-  "scroll",
-  () => {
-    clearTimeout(scrollTimer);
-    scrollTimer = setTimeout(queueVisibleImages, 200);
-  },
-  { passive: true }
-);
+function processNextBatch() {
+  while (activeScans < MAX_CONCURRENT_SCANS && imageQueue.length > 0) {
+    const img = imageQueue.shift();
+    if (img && img.isConnected && !img.dataset.hasOverlay) {
+      scanImage(img);
+    }
+  }
+}
 
-// Initial scan
-setTimeout(queueVisibleImages, 1000);
+function queueImage(img) {
+  const imgUrl = img.src.split("?")[0];
+  if (
+    img.dataset.hasOverlay ||
+    scannedImages.has(imgUrl) ||
+    pendingScans.has(imgUrl)
+  ) {
+    // Re-apply overlay if needed
+    if (blockedImageUrls.has(imgUrl) && !img.dataset.hasOverlay) {
+      const { reason, emoji } = blockedImageUrls.get(imgUrl);
+      addOverlay(img, reason, emoji);
+    }
+    return;
+  }
+
+  if (!imageQueue.includes(img)) {
+    imageQueue.push(img);
+  }
+  processNextBatch();
+}
+
+// Scan all visible images
+function scanAllVisible() {
+  const images = document.querySelectorAll('img[src*="twimg.com"]');
+  for (const img of images) {
+    if (img.width < 50 || img.height < 50) continue;
+    queueImage(img);
+  }
+}
+
+// Intersection Observer - detect images BEFORE they're visible
+let imageObserver;
+
+function startObserving() {
+  // Observe images with 1500px margin (preload ahead of scroll)
+  imageObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          const img = entry.target;
+          queueImage(img);
+        }
+      }
+    },
+    {
+      rootMargin: "1500px 0px", // Preload 1500px ahead
+      threshold: 0,
+    }
+  );
+
+  // Observe existing images
+  observeAllImages();
+
+  // Watch for new images
+  const mutationObserver = new MutationObserver(() => {
+    observeAllImages();
+  });
+  mutationObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+function observeAllImages() {
+  const images = document.querySelectorAll('img[src*="twimg.com"]');
+  for (const img of images) {
+    if (img.width < 50 || img.height < 50) continue;
+    if (!img.dataset.observed) {
+      img.dataset.observed = "true";
+      imageObserver.observe(img);
+    }
+  }
+}
+
+// Initial scan after short delay
+setTimeout(scanAllVisible, 500);
