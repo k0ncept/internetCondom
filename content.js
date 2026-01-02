@@ -4,7 +4,7 @@ let faceMatcher = null;
 let modelsLoaded = false;
 let scannedImages = new Set();
 let blockedImageUrls = new Map();
-let pendingScans = new Map(); // Track in-progress scans
+let pendingScans = new Map();
 let blockWomen = true;
 
 // Parallel processing config
@@ -311,12 +311,17 @@ async function scanImage(img) {
     let blockEmoji = "🚫";
 
     for (const detection of detections) {
-      // Check gender (0.5 threshold = aggressive, catches edge cases)
+      // Check gender - aggressive threshold (45%) to catch edge cases
       if (
         blockWomen &&
         detection.gender === "female" &&
-        detection.genderProbability > 0.5
+        detection.genderProbability > 0.45
       ) {
+        console.log(
+          `👩 Female detected (${(detection.genderProbability * 100).toFixed(
+            0
+          )}%)`
+        );
         shouldBlock = true;
         blockReason = "Foid Detected";
         blockEmoji = "👩";
